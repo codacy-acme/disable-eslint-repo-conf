@@ -205,6 +205,46 @@ def confirm_live_run(orgs: list[str]) -> bool:
     return answer.strip().lower() in ("y", "yes")
 
 
+def resolve_orgs(client: CodacyClient, args: argparse.Namespace) -> list[str] | None:
+    # Use the orgs passed on the CLI, or discover every org the token can see.
+    if args.orgs:
+        return args.orgs
+    orgs = [o["name"] for o in client.list_organizations(args.provider)]
+    if not orgs:
+        print(f"No organizations found for provider {args.provider}", file=sys.stderr)
+        return None
+    return orgs
+
+
+def run(client: CodacyClient, args: argparse.Namespace, orgs: list[str]) -> Summary:
+    # Walk org -> repo -> tool, updating/reporting as we go.
+    summary = Summary()
+    for org in orgs:
+        print(f"== Organization: {args.provider}/{org} ==")
+        for repo_data in client.list_organization_repositories(args.provider, org):
+            name = repo_data["name"]
+            if args.repo and args.repo not in name:
+                continue
+            repo = Repo(provider=args.provider, owner=repo_data.get("owner", org), name=name)
+            summary.repos_scanned += 1
+            process_repo(client, repo, args.dry_run, summary)
+    return summary
+
+
+def report(summary: Summary, dry_run: bool) -> int:
+    # Print the final tally and turn it into a process exit code.
+    verb = "would be updated" if dry_run else "updated"
+    print(
+        f"\nScanned {summary.repos_scanned} repositories. "
+        f"{summary.tools_updated} ESLint tool configuration(s) {verb}, "
+        f"{summary.tools_already_disabled} already disabled, "
+        f"{summary.tools_failed} failed."
+    )
+    if summary.repos_failed:
+        print(f"Repositories that could not be read: {', '.join(summary.repos_failed)}", file=sys.stderr)
+    return 1 if (summary.tools_failed or summary.repos_failed) else 0
+
+
 def main() -> int:
     args = parse_args()
 
@@ -221,37 +261,12 @@ def main() -> int:
 
     client = CodacyClient(token)
 
-    # Default to every organization the token can see if none was given.
-    orgs = args.orgs
-    if not orgs:
-        orgs = [o["name"] for o in client.list_organizations(args.provider)]
-        if not orgs:
-            print(f"No organizations found for provider {args.provider}", file=sys.stderr)
-            return 1
+    orgs = resolve_orgs(client, args)
+    if orgs is None:
+        return 1
 
-    # Walk org -> repo -> tool, updating/reporting as we go.
-    summary = Summary()
-    for org in orgs:
-        print(f"== Organization: {args.provider}/{org} ==")
-        for repo_data in client.list_organization_repositories(args.provider, org):
-            name = repo_data["name"]
-            if args.repo and args.repo not in name:
-                continue
-            repo = Repo(provider=args.provider, owner=repo_data.get("owner", org), name=name)
-            summary.repos_scanned += 1
-            process_repo(client, repo, args.dry_run, summary)
-
-    verb = "would be updated" if args.dry_run else "updated"
-    print(
-        f"\nScanned {summary.repos_scanned} repositories. "
-        f"{summary.tools_updated} ESLint tool configuration(s) {verb}, "
-        f"{summary.tools_already_disabled} already disabled, "
-        f"{summary.tools_failed} failed."
-    )
-    if summary.repos_failed:
-        print(f"Repositories that could not be read: {', '.join(summary.repos_failed)}", file=sys.stderr)
-
-    return 1 if (summary.tools_failed or summary.repos_failed) else 0
+    summary = run(client, args, orgs)
+    return report(summary, args.dry_run)
 
 
 if __name__ == "__main__":
